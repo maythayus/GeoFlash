@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.location.Location
 import android.location.LocationManager
+import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -50,6 +51,9 @@ import com.maythayus1corp.geoflash.util.isFirstLaunch
 import com.maythayus1corp.geoflash.util.markFirstLaunchDone
 import com.maythayus1corp.geoflash.util.saveQrToGallery
 import com.maythayus1corp.geoflash.util.shareQr
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.distinctUntilChangedBy
+import kotlinx.coroutines.withContext
 
 private fun hasLocationPermission(context: Context): Boolean =
     ContextCompat.checkSelfPermission(
@@ -92,13 +96,36 @@ fun MainScreen() {
         }
     }
 
-    // Suivi GPS en temps réel : régénère le QR à chaque nouvelle position.
+    // Android 8-9 : MediaStore exige la permission stockage pour enregistrer dans la galerie.
+    val storagePermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val bmp = qrBitmap
+        if (granted && bmp != null) saveQrToGallery(context, bmp)
+    }
+    val saveQr = { bmp: Bitmap ->
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+            ContextCompat.checkSelfPermission(
+                context, Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            saveQrToGallery(context, bmp)
+        }
+    }
+
+    // Suivi GPS en temps réel : régénère le QR (hors du thread UI) quand le lien change.
     LaunchedEffect(hasPermission) {
         if (hasPermission) {
-            locationUpdates(context).collect { loc ->
-                location = loc
-                qrBitmap = generateQrBitmap(geoUri(loc.latitude, loc.longitude))
-            }
+            locationUpdates(context)
+                .distinctUntilChangedBy { geoUri(it.latitude, it.longitude) to it.accuracy.toInt() }
+                .collect { loc ->
+                    val uri = geoUri(loc.latitude, loc.longitude)
+                    val bmp = withContext(Dispatchers.Default) { generateQrBitmap(uri) }
+                    location = loc
+                    qrBitmap = bmp
+                }
         }
     }
 
@@ -161,14 +188,14 @@ fun MainScreen() {
                     }) { Text("Ouvrir les réglages de localisation") }
                 }
 
-                qrBitmap == null -> {
-                    CircularProgressIndicator()
-                    Text("Recherche de votre position…", textAlign = TextAlign.Center)
-                }
-
                 else -> {
-                    val bmp = qrBitmap!!
-                    val loc = location!!
+                    val bmp = qrBitmap
+                    val loc = location
+                    if (bmp == null || loc == null) {
+                        CircularProgressIndicator()
+                        Text("Recherche de votre position…", textAlign = TextAlign.Center)
+                        return@Column
+                    }
                     Image(
                         bitmap = bmp.asImageBitmap(),
                         contentDescription = "QR code de la position",
@@ -189,7 +216,7 @@ fun MainScreen() {
                         }) { Text("Partager") }
 
                         OutlinedButton(onClick = {
-                            saveQrToGallery(context, bmp)
+                            saveQr(bmp)
                         }) { Text("Sauvegarder") }
                     }
                 }
